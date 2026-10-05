@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
+import json
 import os
 import re
 import time
+from dataclasses import asdict
 from pathlib import Path
 
 from .models import SkillRecord
@@ -127,3 +130,73 @@ def scan_catalog(skills_dir: Path) -> tuple[SkillRecord, ...]:
             continue
         records[key] = record
     return tuple(records[key] for key in sorted(records))
+
+
+# Shared catalog cache: the in-process caches above still stat every SKILL.md
+# on each call and start empty in every new process. With thousands of skills
+# and several sessions starting at once, each process paid a full read. One
+# JSON file per home lets processes share the last scan.
+_LOCK_STALE_S = 120.0
+
+
+def _signature(skills_dir: Path) -> list:
+    """Cheap change marker: adding or removing a skill changes the mtime of its
+    parent folder (the skills root or a category folder)."""
+    with os.scandir(skills_dir) as entries:
+        # os.stat, not entry.stat(): on NTFS the parent listing reports a
+        # folder mtime with a delay, the folder itself is current.
+        folders = sorted([e.name, os.stat(e.path).st_mtime_ns] for e in entries if e.is_dir())
+    return [str(skills_dir), skills_dir.stat().st_mtime_ns, *folders]
+
+
+def cached_catalog(skills_dir: Path, cache: Path) -> tuple[SkillRecord, ...]:
+    """``scan_catalog`` shared across processes through ``cache``.
+
+    Added or removed skills show up at once (folder mtimes); edits inside a
+    SKILL.md show up within ``SKILL_ROUTER_SCAN_TTL`` seconds (0 = no shared
+    cache). One process rescans an expired cache under a lock file while the
+    others keep reading the previous one.
+    """
+    ttl = _scan_ttl()
+    if ttl == 0 or not skills_dir.is_dir():
+        return scan_catalog(skills_dir)
+    sig = _signature(skills_dir)
+    records: tuple[SkillRecord, ...] = ()
+    same = False
+    try:
+        data = json.loads(cache.read_text(encoding="utf-8"))
+        records = tuple(SkillRecord(**{**r, "tags": tuple(r["tags"])}) for r in data["records"])
+        same = data["sig"] == sig
+        if same and time.time() - data["ts"] < ttl:
+            return records
+    except (OSError, ValueError, KeyError, TypeError):
+        same = False
+    lock = cache.with_name(cache.name + ".lock")
+    owner = False
+    try:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        if lock.exists() and time.time() - lock.stat().st_mtime > _LOCK_STALE_S:
+            lock.unlink()  # left behind by a scanner that died
+        os.close(os.open(lock, os.O_CREAT | os.O_EXCL))
+        owner = True
+    except FileExistsError:
+        if same:
+            return records  # another process is rescanning: serve the previous scan
+    except OSError:
+        pass
+    try:
+        fresh = scan_catalog(skills_dir)
+        tmp = cache.with_name(f"{cache.name}.{os.getpid()}.tmp")
+        with contextlib.suppress(OSError):
+            tmp.write_text(
+                json.dumps({"sig": sig, "ts": time.time(), "records": [asdict(r) for r in fresh]}),
+                encoding="utf-8",
+            )
+            os.replace(tmp, cache)
+        with contextlib.suppress(OSError):
+            tmp.unlink(missing_ok=True)
+        return fresh
+    finally:
+        if owner:
+            with contextlib.suppress(OSError):
+                lock.unlink()

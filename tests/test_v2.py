@@ -1,6 +1,7 @@
 """V2 contract tests: evidence, session isolation and fail-safe behavior."""
 
 import json
+import os
 from pathlib import Path
 
 from skill_router.v2.audit import record
@@ -571,3 +572,41 @@ def test_negated_skill_name_is_not_explicit_or_selected() -> None:
 
     assert decision.candidates == ()
     assert decision.explicit_skill_count == 0
+
+
+def test_cached_catalog_is_shared_and_follows_added_skills(monkeypatch, tmp_path: Path) -> None:
+    """A second process reads the shared cache instead of re-reading every SKILL.md."""
+    from skill_router.v2 import catalog as catalog_mod
+
+    monkeypatch.delenv("SKILL_ROUTER_SCAN_TTL", raising=False)
+    skills, cache = _skills(tmp_path), tmp_path / "data" / "catalog-cache.json"
+    first = catalog_mod.cached_catalog(skills, cache)
+    assert first == scan_catalog(skills) and cache.is_file()
+    scans: list[Path] = []
+    monkeypatch.setattr(catalog_mod, "scan_catalog", lambda d: scans.append(d) or ())
+    assert catalog_mod.cached_catalog(skills, cache) == first and not scans, "fresh cache is read"
+    folder = skills / "software-development"
+    mtime = folder.stat().st_mtime_ns
+    fresh = folder / "fresh-skill"
+    fresh.mkdir()
+    (fresh / "SKILL.md").write_text("---\nname: fresh-skill\n---\n", encoding="utf-8")
+    os.utime(folder, ns=(mtime + 10**9, mtime + 10**9))  # coarse fs clocks may not tick within a test
+    catalog_mod.cached_catalog(skills, cache)
+    assert scans, "an added skill changes its folder mtime: rescan"
+
+
+def test_cached_catalog_serves_previous_scan_while_another_process_rescans(monkeypatch, tmp_path: Path) -> None:
+    from skill_router.v2 import catalog as catalog_mod
+
+    skills, cache = _skills(tmp_path), tmp_path / "data" / "catalog-cache.json"
+    first = catalog_mod.cached_catalog(skills, cache)
+    scans: list[Path] = []
+    monkeypatch.setattr(catalog_mod, "scan_catalog", lambda d: scans.append(d) or ())
+    monkeypatch.setattr(catalog_mod, "_scan_ttl", lambda: -1.0)  # cache always expired
+    lock = cache.with_name(cache.name + ".lock")
+    lock.write_text("", encoding="utf-8")
+    assert catalog_mod.cached_catalog(skills, cache) == first and not scans
+    assert lock.exists(), "the other process's lock is left alone"
+    lock.unlink()
+    catalog_mod.cached_catalog(skills, cache)
+    assert scans and not lock.exists(), "without a lock this process rescans and releases its lock"
