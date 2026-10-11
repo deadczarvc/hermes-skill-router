@@ -585,14 +585,33 @@ def test_cached_catalog_is_shared_and_follows_added_skills(monkeypatch, tmp_path
     scans: list[Path] = []
     monkeypatch.setattr(catalog_mod, "scan_catalog", lambda d: scans.append(d) or ())
     assert catalog_mod.cached_catalog(skills, cache) == first and not scans, "fresh cache is read"
+    monkeypatch.setattr(catalog_mod, "scan_catalog", scan_catalog)
     folder = skills / "software-development"
     mtime = folder.stat().st_mtime_ns
     fresh = folder / "fresh-skill"
     fresh.mkdir()
     (fresh / "SKILL.md").write_text("---\nname: fresh-skill\n---\n", encoding="utf-8")
     os.utime(folder, ns=(mtime + 10**9, mtime + 10**9))  # coarse fs clocks may not tick within a test
+    names = {r.name for r in catalog_mod.cached_catalog(skills, cache)}
+    assert "fresh-skill" in names, "an added skill shows up on the next call, not after the walk TTL"
+    stored = json.loads(cache.read_text(encoding="utf-8"))["records"]
+    assert "fresh-skill" in {r["name"] for r in stored}, "and the shared cache carries it to other processes"
+
+
+def test_cached_catalog_treats_a_future_timestamp_as_stale(monkeypatch, tmp_path: Path) -> None:
+    """A clock that moved back must not freeze the cache until it catches up."""
+    from skill_router.v2 import catalog as catalog_mod
+
+    monkeypatch.delenv("SKILL_ROUTER_SCAN_TTL", raising=False)
+    skills, cache = _skills(tmp_path), tmp_path / "data" / "catalog-cache.json"
     catalog_mod.cached_catalog(skills, cache)
-    assert scans, "an added skill changes its folder mtime: rescan"
+    data = json.loads(cache.read_text(encoding="utf-8"))
+    data["ts"] += 3600
+    cache.write_text(json.dumps(data), encoding="utf-8")
+    scans: list[Path] = []
+    monkeypatch.setattr(catalog_mod, "scan_catalog", lambda d: scans.append(d) or ())
+    catalog_mod.cached_catalog(skills, cache)
+    assert scans, "a cache stamped in the future is rescanned"
 
 
 def test_cached_catalog_serves_previous_scan_while_another_process_rescans(monkeypatch, tmp_path: Path) -> None:

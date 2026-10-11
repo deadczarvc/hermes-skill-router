@@ -6,6 +6,7 @@ import contextlib
 import json
 import os
 import re
+import threading
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -152,10 +153,11 @@ def _signature(skills_dir: Path) -> list:
 def cached_catalog(skills_dir: Path, cache: Path) -> tuple[SkillRecord, ...]:
     """``scan_catalog`` shared across processes through ``cache``.
 
-    Added or removed skills show up at once (folder mtimes); edits inside a
-    SKILL.md show up within ``SKILL_ROUTER_SCAN_TTL`` seconds (0 = no shared
-    cache). One process rescans an expired cache under a lock file while the
-    others keep reading the previous one.
+    Added or removed skills show up on the next call (folder mtimes); edits
+    inside a SKILL.md show up within ``SKILL_ROUTER_SCAN_TTL`` seconds (0 = no
+    shared cache). When only the TTL expired, one process rescans under a lock
+    file while the others keep reading the previous scan; after an added or
+    removed skill every caller rescans.
     """
     ttl = _scan_ttl()
     if ttl == 0 or not skills_dir.is_dir():
@@ -167,16 +169,18 @@ def cached_catalog(skills_dir: Path, cache: Path) -> tuple[SkillRecord, ...]:
         data = json.loads(cache.read_text(encoding="utf-8"))
         records = tuple(SkillRecord(**{**r, "tags": tuple(r["tags"])}) for r in data["records"])
         same = data["sig"] == sig
-        if same and time.time() - data["ts"] < ttl:
+        if same and 0 <= time.time() - data["ts"] < ttl:  # a ts in the future (clock moved back) is stale
             return records
     except (OSError, ValueError, KeyError, TypeError):
         same = False
+    if not same:
+        _SCAN_CACHE.pop(str(skills_dir), None)  # the tree changed: the in-process walk is stale too
     lock = cache.with_name(cache.name + ".lock")
     owner = False
     try:
         cache.parent.mkdir(parents=True, exist_ok=True)
-        if lock.exists() and time.time() - lock.stat().st_mtime > _LOCK_STALE_S:
-            lock.unlink()  # left behind by a scanner that died
+        if lock.exists() and not 0 <= time.time() - lock.stat().st_mtime <= _LOCK_STALE_S:
+            lock.unlink()  # left behind by a scanner that died (or stamped by a clock that moved)
         os.close(os.open(lock, os.O_CREAT | os.O_EXCL))
         owner = True
     except FileExistsError:
@@ -186,7 +190,7 @@ def cached_catalog(skills_dir: Path, cache: Path) -> tuple[SkillRecord, ...]:
         pass
     try:
         fresh = scan_catalog(skills_dir)
-        tmp = cache.with_name(f"{cache.name}.{os.getpid()}.tmp")
+        tmp = cache.with_name(f"{cache.name}.{os.getpid()}.{threading.get_ident()}.tmp")
         with contextlib.suppress(OSError):
             tmp.write_text(
                 json.dumps({"sig": sig, "ts": time.time(), "records": [asdict(r) for r in fresh]}),
