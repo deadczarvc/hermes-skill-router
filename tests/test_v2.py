@@ -598,6 +598,24 @@ def test_cached_catalog_is_shared_and_follows_added_skills(monkeypatch, tmp_path
     assert "fresh-skill" in {r["name"] for r in stored}, "and the shared cache carries it to other processes"
 
 
+def test_cached_catalog_survives_a_dangling_skill_link(monkeypatch, tmp_path: Path) -> None:
+    """A dangling junction or symlink in the skills root cannot be stat'ed; routing must not fail on it."""
+    from skill_router.v2 import catalog as catalog_mod
+
+    monkeypatch.delenv("SKILL_ROUTER_SCAN_TTL", raising=False)
+    skills, cache = _skills(tmp_path), tmp_path / "data" / "catalog-cache.json"
+    (skills / "dangling").mkdir()
+    real_stat = os.stat
+
+    def stat(path, *args, **kwargs):
+        if os.fspath(path).endswith("dangling"):
+            raise FileNotFoundError(2, "No such file or directory", os.fspath(path))
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(catalog_mod.os, "stat", stat)
+    assert catalog_mod.cached_catalog(skills, cache) == scan_catalog(skills)
+
+
 def test_cached_catalog_treats_a_future_timestamp_as_stale(monkeypatch, tmp_path: Path) -> None:
     """A clock that moved back must not freeze the cache until it catches up."""
     from skill_router.v2 import catalog as catalog_mod

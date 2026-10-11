@@ -140,13 +140,20 @@ def scan_catalog(skills_dir: Path) -> tuple[SkillRecord, ...]:
 _LOCK_STALE_S = 120.0
 
 
+def _mtime_ns(path: str) -> int | None:
+    try:
+        return os.stat(path).st_mtime_ns
+    except OSError:  # a dangling symlink or junction: the tree walk skips it too
+        return None
+
+
 def _signature(skills_dir: Path) -> list:
     """Cheap change marker: adding or removing a skill changes the mtime of its
     parent folder (the skills root or a category folder)."""
     with os.scandir(skills_dir) as entries:
         # os.stat, not entry.stat(): on NTFS the parent listing reports a
         # folder mtime with a delay, the folder itself is current.
-        folders = sorted([e.name, os.stat(e.path).st_mtime_ns] for e in entries if e.is_dir())
+        folders = sorted([e.name, _mtime_ns(e.path)] for e in entries if e.is_dir())
     return [str(skills_dir), skills_dir.stat().st_mtime_ns, *folders]
 
 
