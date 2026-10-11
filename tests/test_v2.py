@@ -695,3 +695,18 @@ def test_cached_catalog_falls_back_when_signature_races_tree_change(monkeypatch,
     skills, cache = _skills(tmp_path), tmp_path / "data" / "catalog-cache.json"
     monkeypatch.setattr(catalog_mod, "_signature", lambda _: (_ for _ in ()).throw(FileNotFoundError()))
     assert catalog_mod.cached_catalog(skills, cache) == scan_catalog(skills)
+
+
+def test_catalog_never_routes_to_archived_or_backup_skills(tmp_path: Path) -> None:
+    """The catalog must agree with Hermes: curator archives are not active skills."""
+    from skill_router.v2 import catalog as catalog_mod
+
+    skills = _skills(tmp_path)
+    for hidden in (".archive", ".curator_backups", ".git"):
+        archived = skills / hidden / "obsolete"
+        archived.mkdir(parents=True)
+        (archived / "SKILL.md").write_text("---\nname: obsolete\n---\n", encoding="utf-8")
+    cache = tmp_path / "data" / "catalog-cache.json"
+    assert {r.name for r in scan_catalog(skills)} == {"android-emulator", "pdf-extraction"}
+    cached_names = {r.name for r in catalog_mod.cached_catalog(skills, cache)}
+    assert cached_names == {"android-emulator", "pdf-extraction"}
