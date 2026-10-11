@@ -647,3 +647,51 @@ def test_cached_catalog_serves_previous_scan_while_another_process_rescans(monke
     lock.unlink()
     catalog_mod.cached_catalog(skills, cache)
     assert scans and not lock.exists(), "without a lock this process rescans and releases its lock"
+
+
+def test_cached_catalog_does_not_publish_without_lock_on_changed_tree(monkeypatch, tmp_path: Path) -> None:
+    """An unlocked second scanner cannot replace the lock owner's future snapshot."""
+    from skill_router.v2 import catalog as catalog_mod
+
+    monkeypatch.delenv("SKILL_ROUTER_SCAN_TTL", raising=False)
+    skills, cache = _skills(tmp_path), tmp_path / "data" / "catalog-cache.json"
+    catalog_mod.cached_catalog(skills, cache)
+    before = cache.read_bytes()
+    lock = cache.with_name(cache.name + ".lock")
+    lock.write_text("", encoding="utf-8")
+    folder = skills / "software-development"
+    new_skill = folder / "added-during-locked-scan"
+    new_skill.mkdir()
+    (new_skill / "SKILL.md").write_text("---\nname: added-during-locked-scan\n---\n", encoding="utf-8")
+    result = catalog_mod.cached_catalog(skills, cache)
+    assert "added-during-locked-scan" in {r.name for r in result}
+    assert cache.read_bytes() == before, "only the owner of an existing lock may publish"
+    assert lock.exists()
+
+
+def test_cached_catalog_refreshes_nested_changes_on_ttl(monkeypatch, tmp_path: Path) -> None:
+    """Nested categories are outside the cheap first-level signature, not permanent cache misses."""
+    from skill_router.v2 import catalog as catalog_mod
+
+    monkeypatch.setenv("SKILL_ROUTER_SCAN_TTL", "1")
+    skills, cache = _skills(tmp_path), tmp_path / "data" / "catalog-cache.json"
+    nested = skills / "software-development" / "subsection"
+    nested.mkdir()
+    catalog_mod.cached_catalog(skills, cache)
+    added = nested / "nested-new"
+    added.mkdir()
+    (added / "SKILL.md").write_text("---\nname: nested-new\n---\n", encoding="utf-8")
+    assert "nested-new" not in {r.name for r in catalog_mod.cached_catalog(skills, cache)}
+    data = json.loads(cache.read_text(encoding="utf-8"))
+    data["ts"] -= 2
+    cache.write_text(json.dumps(data), encoding="utf-8")
+    monkeypatch.setattr(catalog_mod.time, "monotonic", lambda: 999999999.0)
+    assert "nested-new" in {r.name for r in catalog_mod.cached_catalog(skills, cache)}
+
+
+def test_cached_catalog_falls_back_when_signature_races_tree_change(monkeypatch, tmp_path: Path) -> None:
+    from skill_router.v2 import catalog as catalog_mod
+
+    skills, cache = _skills(tmp_path), tmp_path / "data" / "catalog-cache.json"
+    monkeypatch.setattr(catalog_mod, "_signature", lambda _: (_ for _ in ()).throw(FileNotFoundError()))
+    assert catalog_mod.cached_catalog(skills, cache) == scan_catalog(skills)

@@ -160,16 +160,22 @@ def _signature(skills_dir: Path) -> list:
 def cached_catalog(skills_dir: Path, cache: Path) -> tuple[SkillRecord, ...]:
     """``scan_catalog`` shared across processes through ``cache``.
 
-    Added or removed skills show up on the next call (folder mtimes); edits
-    inside a SKILL.md show up within ``SKILL_ROUTER_SCAN_TTL`` seconds (0 = no
-    shared cache). When only the TTL expired, one process rescans under a lock
-    file while the others keep reading the previous scan; after an added or
-    removed skill every caller rescans.
+    Added or removed skills directly under the root or its first-level folders
+    show up on the next call. Deeper tree changes and SKILL.md edits show up
+    within ``SKILL_ROUTER_SCAN_TTL`` seconds (0 = no shared cache). On expiry,
+    one process rescans under a lock while others serve the previous scan.
+    A changed signature triggers a fresh scan for every caller, but only the
+    lock owner may publish its snapshot to the shared cache.
     """
     ttl = _scan_ttl()
     if ttl == 0 or not skills_dir.is_dir():
         return scan_catalog(skills_dir)
-    sig = _signature(skills_dir)
+    try:
+        sig = _signature(skills_dir)
+    except OSError:
+        # A category can disappear between is_dir() and scandir/stat().
+        # The per-file scanner already tolerates disappearing skill paths.
+        return scan_catalog(skills_dir)
     records: tuple[SkillRecord, ...] = ()
     same = False
     try:
@@ -198,14 +204,15 @@ def cached_catalog(skills_dir: Path, cache: Path) -> tuple[SkillRecord, ...]:
     try:
         fresh = scan_catalog(skills_dir)
         tmp = cache.with_name(f"{cache.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-        with contextlib.suppress(OSError):
-            tmp.write_text(
-                json.dumps({"sig": sig, "ts": time.time(), "records": [asdict(r) for r in fresh]}),
-                encoding="utf-8",
-            )
-            os.replace(tmp, cache)
-        with contextlib.suppress(OSError):
-            tmp.unlink(missing_ok=True)
+        if owner:
+            with contextlib.suppress(OSError):
+                tmp.write_text(
+                    json.dumps({"sig": sig, "ts": time.time(), "records": [asdict(r) for r in fresh]}),
+                    encoding="utf-8",
+                )
+                os.replace(tmp, cache)
+            with contextlib.suppress(OSError):
+                tmp.unlink(missing_ok=True)
         return fresh
     finally:
         if owner:
